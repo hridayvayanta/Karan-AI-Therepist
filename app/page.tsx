@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   Mic, 
   MicOff, 
@@ -10,15 +10,17 @@ import {
   Brain, 
   Sparkles, 
   Smile, 
-  Settings, 
   X, 
   Plus, 
   Trash2, 
   Radio, 
   MessageSquare,
   CheckCircle2,
-  Calendar,
-  Activity
+  PhoneCall,
+  PhoneOff,
+  Headphones,
+  Flame,
+  Volume
 } from 'lucide-react';
 
 interface Message {
@@ -35,26 +37,34 @@ interface MemoryItem {
   createdAt: string;
 }
 
+const NEURAL_VOICES = [
+  { id: 'en-IN-PrabhatNeural', name: 'Prabhat (Indian English — Warm & Conversational)' },
+  { id: 'en-US-ChristopherNeural', name: 'Christopher (US English — Relaxed & Friendly)' },
+  { id: 'en-US-AndrewNeural', name: 'Andrew (US English — Deep & Grounded)' },
+  { id: 'en-US-GuyNeural', name: 'Guy (US English — Natural & Casual)' },
+  { id: 'en-GB-RyanNeural', name: 'Ryan (British English — Thoughtful)' },
+  { id: 'en-IN-NeerjaNeural', name: 'Neerja (Indian English — Gentle & Clear)' },
+];
+
 export default function KaranApp() {
-  // App state
+  // App mode
   const [mode, setMode] = useState<'voice' | 'chat'>('voice');
   const [messages, setMessages] = useState<Message[]>([
     {
       role: 'assistant',
-      content: "Hey Hriday. I'm here. How's everything going with you today?",
+      content: "Hey Hriday. I'm right here. How are you feeling today?",
     },
   ]);
   const [inputText, setInputText] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [conversationId, setConversationId] = useState<string | null>(null);
 
-  // Voice State
-  const [isListening, setIsListening] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false);
-  const [voiceEnabled, setVoiceEnabled] = useState(true);
+  // Continuous Hands-Free Call Mode State
+  const [callActive, setCallActive] = useState(false);
+  const [callState, setCallState] = useState<'idle' | 'listening' | 'thinking' | 'speaking'>('idle');
   const [liveTranscript, setLiveTranscript] = useState('');
-  const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
-  const [selectedVoice, setSelectedVoice] = useState<string>('');
+  const [selectedVoice, setSelectedVoice] = useState('en-IN-PrabhatNeural');
+  const [voiceVolume, setVoiceVolume] = useState(true);
 
   // Drawers & Modals
   const [showMemoryDrawer, setShowMemoryDrawer] = useState(false);
@@ -67,32 +77,26 @@ export default function KaranApp() {
   const [moodNotes, setMoodNotes] = useState('');
   const [moodSaved, setMoodSaved] = useState(false);
 
-  // Speech Recognition Reference
+  // Audio & Speech References
   const recognitionRef = useRef<any>(null);
+  const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
+  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const callActiveRef = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // 1. Initial Load: Fetch voices, past conversation, memories
+  // Sync ref with state
   useEffect(() => {
-    // Load voices
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      const updateVoices = () => {
-        const voices = window.speechSynthesis.getVoices();
-        setAvailableVoices(voices);
-        // Find best natural English voice
-        const preferred = voices.find(v => 
-          v.name.includes('Natural') || 
-          v.name.includes('Daniel') || 
-          v.name.includes('Google UK English Male') || 
-          v.name.includes('Google US English') ||
-          v.lang.startsWith('en')
-        );
-        if (preferred) setSelectedVoice(preferred.name);
-      };
-      updateVoices();
-      window.speechSynthesis.onvoiceschanged = updateVoices;
-    }
+    callActiveRef.current = callActive;
+  }, [callActive]);
 
-    // Load initial chat history
+  // Auto-scroll chat
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  // Initial Load
+  useEffect(() => {
+    // Load initial chat history from SQLite
     fetch('/api/chat')
       .then(res => res.json())
       .then(data => {
@@ -103,14 +107,13 @@ export default function KaranApp() {
       })
       .catch(() => {});
 
-    // Load memories
+    // Load memories from SQLite
     fetchMemories();
-  }, []);
 
-  // Auto-scroll chat
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    return () => {
+      stopCall();
+    };
+  }, []);
 
   const fetchMemories = () => {
     fetch('/api/memories')
@@ -121,66 +124,150 @@ export default function KaranApp() {
       .catch(() => {});
   };
 
-  // 2. Speech Synthesis (Karan Speaks)
-  const speakText = (text: string) => {
-    if (!voiceEnabled || typeof window === 'undefined' || !('speechSynthesis' in window)) {
+  // ==========================================================================
+  // NATURAL NEURAL SPEECH ENGINE (MICROSOFT NEURAL EDGETTS)
+  // ==========================================================================
+  const playNeuralSpeech = async (text: string): Promise<void> => {
+    if (!voiceVolume) {
+      if (callActiveRef.current) resumeContinuousListening();
       return;
     }
 
+    setCallState('speaking');
+
+    try {
+      // Stop any playing audio
+      if (audioPlayerRef.current) {
+        audioPlayerRef.current.pause();
+        audioPlayerRef.current = null;
+      }
+
+      const res = await fetch('/api/voice/speak', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text,
+          voice: selectedVoice,
+        }),
+      });
+
+      if (!res.ok) throw new Error('Neural TTS failed');
+
+      const blob = await res.blob();
+      const audioUrl = URL.createObjectURL(blob);
+      const audio = new Audio(audioUrl);
+      audioPlayerRef.current = audio;
+
+      audio.onended = () => {
+        URL.revokeObjectURL(audioUrl);
+        audioPlayerRef.current = null;
+        setCallState('idle');
+        // CONTINUOUS CONVERSATION LOOP: Auto-listen immediately!
+        if (callActiveRef.current) {
+          resumeContinuousListening();
+        }
+      };
+
+      audio.onerror = () => {
+        audioPlayerRef.current = null;
+        setCallState('idle');
+        if (callActiveRef.current) resumeContinuousListening();
+      };
+
+      await audio.play();
+    } catch (err) {
+      console.warn('Neural TTS failed, falling back to local speech synthesis:', err);
+      // Fallback to browser speech
+      fallbackSpeak(text);
+    }
+  };
+
+  const fallbackSpeak = (text: string) => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
     window.speechSynthesis.cancel();
 
-    // Clean markdown symbols for natural speech
-    const cleanSpeech = text
-      .replace(/[*_#`~\[\]()]/g, '')
-      .replace(/https?:\/\/\S+/g, '')
-      .trim();
-
-    const utterance = new SpeechSynthesisUtterance(cleanSpeech);
-    
-    if (selectedVoice) {
-      const voiceObj = availableVoices.find(v => v.name === selectedVoice);
-      if (voiceObj) utterance.voice = voiceObj;
-    }
-
+    const cleanText = text.replace(/[*_#`~\[\]()]/g, '').trim();
+    const utterance = new SpeechSynthesisUtterance(cleanText);
     utterance.rate = 1.0;
     utterance.pitch = 0.98;
 
-    utterance.onstart = () => setIsSpeaking(true);
-    utterance.onend = () => setIsSpeaking(false);
-    utterance.onerror = () => setIsSpeaking(false);
+    utterance.onend = () => {
+      setCallState('idle');
+      if (callActiveRef.current) resumeContinuousListening();
+    };
+    utterance.onerror = () => {
+      setCallState('idle');
+      if (callActiveRef.current) resumeContinuousListening();
+    };
 
     window.speechSynthesis.speak(utterance);
   };
 
-  // 3. Speech Recognition (User Speaks)
-  const toggleListening = () => {
-    if (isListening) {
-      stopListening();
-    } else {
-      startListening();
+  // ==========================================================================
+  // CONTINUOUS CONVERSATION LOOP & RECOGNITION
+  // ==========================================================================
+  const startCall = () => {
+    setCallActive(true);
+    callActiveRef.current = true;
+    startContinuousListening();
+  };
+
+  const stopCall = () => {
+    setCallActive(false);
+    callActiveRef.current = false;
+    setCallState('idle');
+    setLiveTranscript('');
+
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.abort();
+      } catch (e) {}
+      recognitionRef.current = null;
+    }
+    if (audioPlayerRef.current) {
+      audioPlayerRef.current.pause();
+      audioPlayerRef.current = null;
+    }
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
     }
   };
 
-  const startListening = () => {
+  const resumeContinuousListening = () => {
+    setTimeout(() => {
+      if (callActiveRef.current) {
+        startContinuousListening();
+      }
+    }, 350);
+  };
+
+  const startContinuousListening = () => {
     if (typeof window === 'undefined') return;
 
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SpeechRecognition) {
-      alert('Speech Recognition is not supported in this browser. Please use Google Chrome or Edge.');
+      alert('Speech Recognition is supported in Chrome, Edge, and Safari.');
+      stopCall();
       return;
     }
 
-    // Stop ongoing speech
-    window.speechSynthesis?.cancel();
-    setIsSpeaking(false);
+    // Abort existing instance
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.abort();
+      } catch (e) {}
+    }
 
     const recognition = new SpeechRecognition();
-    recognition.continuous = false;
+    recognition.continuous = true;
     recognition.interimResults = true;
     recognition.lang = 'en-US';
 
+    let currentSpokenBuffer = '';
+
     recognition.onstart = () => {
-      setIsListening(true);
+      setCallState('listening');
       setLiveTranscript('');
     };
 
@@ -188,51 +275,108 @@ export default function KaranApp() {
       let interim = '';
       for (let i = event.resultIndex; i < event.results.length; ++i) {
         if (event.results[i].isFinal) {
-          const finalTranscript = event.results[i][0].transcript;
-          setLiveTranscript(finalTranscript);
-          handleSendMessage(finalTranscript);
-          stopListening();
-          return;
+          currentSpokenBuffer += ' ' + event.results[i][0].transcript;
         } else {
           interim += event.results[i][0].transcript;
         }
       }
-      setLiveTranscript(interim);
+
+      const activeText = (currentSpokenBuffer + ' ' + interim).trim();
+      setLiveTranscript(activeText);
+
+      // RESET SILENCE DETECTION TIMER:
+      // When the user pauses speaking for 1.3 seconds, automatically submit!
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+
+      if (activeText.length > 2) {
+        silenceTimerRef.current = setTimeout(() => {
+          if (callActiveRef.current && activeText.trim()) {
+            try {
+              recognition.stop();
+            } catch (e) {}
+            handleVoiceSubmit(activeText.trim());
+          }
+        }, 1300);
+      }
     };
 
     recognition.onerror = (e: any) => {
-      console.warn('Speech recognition error:', e.error);
-      setIsListening(false);
+      if (e.error === 'no-speech') {
+        // No speech detected, quietly keep listening if call is active
+        return;
+      }
+      console.warn('Recognition notice:', e.error);
     };
 
     recognition.onend = () => {
-      setIsListening(false);
+      // If call is still active and we aren't thinking/speaking, restart listening automatically!
+      if (callActiveRef.current && callState !== 'thinking' && callState !== 'speaking') {
+        try {
+          recognition.start();
+        } catch (e) {}
+      }
     };
 
     recognitionRef.current = recognition;
     try {
       recognition.start();
     } catch (e) {
-      console.error(e);
+      console.error('Error starting recognition:', e);
     }
   };
 
-  const stopListening = () => {
-    if (recognitionRef.current) {
-      recognitionRef.current.stop();
-      setIsListening(false);
+  // Handle incoming voice submission
+  const handleVoiceSubmit = async (transcript: string) => {
+    if (!transcript.trim()) return;
+
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    setCallState('thinking');
+    setLiveTranscript('');
+
+    const userMsg: Message = { role: 'user', content: transcript };
+    setMessages(prev => [...prev, userMsg]);
+    setIsLoading(true);
+
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: transcript,
+          conversationId,
+        }),
+      });
+
+      const data = await res.json();
+      if (data.reply) {
+        const assistantMsg: Message = { role: 'assistant', content: data.reply };
+        setMessages(prev => [...prev, assistantMsg]);
+        if (data.conversationId) setConversationId(data.conversationId);
+
+        // PLAY NATURAL NEURAL AUDIO!
+        await playNeuralSpeech(data.reply);
+
+        // Refresh memories
+        fetchMemories();
+      }
+    } catch (err) {
+      console.error('Voice chat error:', err);
+      const fallback = "I'm listening, Hriday. Take your time.";
+      setMessages(prev => [...prev, { role: 'assistant', content: fallback }]);
+      await playNeuralSpeech(fallback);
+    } finally {
+      setIsLoading(false);
     }
   };
 
-  // 4. Send Message Handler
-  const handleSendMessage = async (textToSend?: string) => {
+  // Text Chat Submit Handler
+  const handleTextSubmit = async (textToSend?: string) => {
     const text = textToSend || inputText;
     if (!text || !text.trim() || isLoading) return;
 
     const userMsg: Message = { role: 'user', content: text.trim() };
     setMessages(prev => [...prev, userMsg]);
     setInputText('');
-    setLiveTranscript('');
     setIsLoading(true);
 
     try {
@@ -251,26 +395,20 @@ export default function KaranApp() {
         setMessages(prev => [...prev, assistantMsg]);
         if (data.conversationId) setConversationId(data.conversationId);
 
-        // Speak aloud
-        speakText(data.reply);
+        if (voiceVolume) {
+          playNeuralSpeech(data.reply);
+        }
 
-        // Refresh memories in case a new fact was detected
         fetchMemories();
       }
-    } catch (error) {
-      console.error('Chat error:', error);
-      const fallbackMsg: Message = {
-        role: 'assistant',
-        content: "I'm right here with you, Hriday. Tell me more about what you're thinking.",
-      };
-      setMessages(prev => [...prev, fallbackMsg]);
-      speakText(fallbackMsg.content);
+    } catch (err) {
+      console.error('Chat error:', err);
     } finally {
       setIsLoading(false);
     }
   };
 
-  // 5. Memory Management
+  // Memories
   const handleAddMemory = async () => {
     if (!newMemoryText.trim()) return;
     try {
@@ -300,16 +438,13 @@ export default function KaranApp() {
     } catch (e) {}
   };
 
-  // 6. Mood Check-in
+  // Mood
   const handleSaveMood = async () => {
     try {
       const res = await fetch('/api/mood', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          score: moodScore,
-          notes: moodNotes,
-        }),
+        body: JSON.stringify({ score: moodScore, notes: moodNotes }),
       });
       if (res.ok) {
         setMoodSaved(true);
@@ -323,24 +458,26 @@ export default function KaranApp() {
   };
 
   return (
-    <div className="flex flex-col h-screen w-full bg-[#09090d] text-[#f4f4f7] overflow-hidden">
-      {/* Top Header */}
-      <header className="h-16 border-b border-white/[0.06] bg-[#0c0c12]/80 backdrop-blur-md px-6 flex items-center justify-between z-20">
+    <div className="flex flex-col h-screen w-full bg-[#08080c] text-[#f4f4f7] overflow-hidden select-none">
+      {/* Top Bar */}
+      <header className="h-16 border-b border-white/[0.06] bg-[#0c0c14]/90 backdrop-blur-md px-6 flex items-center justify-between z-20">
         <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-purple-600 to-indigo-400 flex items-center justify-center font-bold text-xs text-white shadow-lg shadow-purple-500/20">
+          <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-purple-600 to-indigo-500 flex items-center justify-center font-bold text-xs text-white shadow-lg shadow-purple-600/30">
             K
           </div>
           <div>
             <div className="flex items-center gap-2">
               <span className="font-semibold text-sm tracking-wide">Karan</span>
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+              <span className={`w-2 h-2 rounded-full ${callActive ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-600'}`}></span>
             </div>
-            <span className="text-[11px] text-zinc-500 font-mono">Personal AI Companion · Free Offline Core</span>
+            <span className="text-[11px] text-zinc-500 font-mono">
+              {callActive ? 'Continuous Call Active · Hands-Free' : 'Online · Ready to Talk'}
+            </span>
           </div>
         </div>
 
-        {/* Mode Selector Tabs */}
-        <div className="flex items-center bg-[#151520] p-1 rounded-xl border border-white/[0.08]">
+        {/* Mode Switcher */}
+        <div className="flex items-center bg-[#14141f] p-1 rounded-xl border border-white/[0.08]">
           <button
             onClick={() => setMode('voice')}
             className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-medium transition-all ${
@@ -350,7 +487,7 @@ export default function KaranApp() {
             }`}
           >
             <Radio className="w-3.5 h-3.5" />
-            Voice Talk
+            Continuous Voice
           </button>
           <button
             onClick={() => setMode('chat')}
@@ -365,23 +502,35 @@ export default function KaranApp() {
           </button>
         </div>
 
-        {/* Action Controls */}
+        {/* Right Controls */}
         <div className="flex items-center gap-2">
-          {/* Daily Mood Button */}
+          {/* Neural Voice Picker */}
+          <select
+            value={selectedVoice}
+            onChange={e => setSelectedVoice(e.target.value)}
+            className="hidden md:block bg-[#14141f] border border-white/[0.08] text-xs text-zinc-300 rounded-lg px-2.5 py-1.5 outline-none cursor-pointer max-w-[190px] truncate"
+            title="Karan's Natural Neural Voice"
+          >
+            {NEURAL_VOICES.map(v => (
+              <option key={v.id} value={v.id}>
+                {v.name}
+              </option>
+            ))}
+          </select>
+
+          {/* Daily Mood Check-in */}
           <button
             onClick={() => setShowMoodModal(true)}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-xs text-zinc-300 transition-colors"
-            title="Log Today's Mood"
           >
             <Smile className="w-3.5 h-3.5 text-amber-400" />
-            <span className="hidden sm:inline">Daily Check-in</span>
+            <span className="hidden sm:inline">Mood</span>
           </button>
 
-          {/* Memory Drawer Button */}
+          {/* Memories */}
           <button
             onClick={() => setShowMemoryDrawer(true)}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-xs text-zinc-300 transition-colors relative"
-            title="Karan's Memory Drawer"
           >
             <Brain className="w-3.5 h-3.5 text-purple-400" />
             <span className="hidden sm:inline">Memories</span>
@@ -392,37 +541,50 @@ export default function KaranApp() {
             )}
           </button>
 
-          {/* Voice Output Mute Toggle */}
+          {/* Mute toggle */}
           <button
             onClick={() => {
-              setVoiceEnabled(!voiceEnabled);
-              if (voiceEnabled) window.speechSynthesis?.cancel();
+              setVoiceVolume(!voiceVolume);
+              if (voiceVolume && audioPlayerRef.current) {
+                audioPlayerRef.current.pause();
+              }
             }}
             className={`p-2 rounded-lg border transition-colors ${
-              voiceEnabled
+              voiceVolume
                 ? 'bg-purple-500/10 border-purple-500/30 text-purple-300'
                 : 'bg-white/[0.04] border-white/[0.08] text-zinc-500'
             }`}
-            title={voiceEnabled ? 'Voice Output Active' : 'Voice Output Muted'}
+            title={voiceVolume ? 'Voice Output Active' : 'Muted'}
           >
-            {voiceEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
+            {voiceVolume ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
           </button>
         </div>
       </header>
 
-      {/* Main Content Area */}
+      {/* Main Body */}
       <main className="flex-1 relative flex flex-col overflow-hidden">
         {mode === 'voice' ? (
           /* ==========================================================================
-             VOICE TALK MODE (AMBIENT GLOWING ORB INTERFACE)
+             CONTINUOUS HANDS-FREE VOICE CALL
              ========================================================================== */
-          <div className="flex-1 flex flex-col items-center justify-center p-6 relative">
-            {/* Ambient Background Gradient */}
-            <div className="absolute inset-0 bg-radial-at-c from-purple-900/10 via-transparent to-transparent pointer-events-none"></div>
+          <div className="flex-1 flex flex-col items-center justify-between p-6 py-10 relative">
+            {/* Background Atmosphere */}
+            <div className="absolute inset-0 bg-radial-at-c from-purple-900/15 via-transparent to-transparent pointer-events-none"></div>
+
+            {/* Top Status Call Pill */}
+            <div className="flex items-center gap-2 px-4 py-1.5 rounded-full bg-white/[0.04] border border-white/[0.08] text-xs font-mono">
+              <span className={`w-2 h-2 rounded-full ${callActive ? 'bg-emerald-400 animate-ping' : 'bg-zinc-500'}`}></span>
+              <span className="text-zinc-300">
+                {callState === 'listening' ? 'Listening to you... Speak freely' : 
+                 callState === 'thinking' ? 'Karan is thinking...' : 
+                 callState === 'speaking' ? 'Karan is speaking...' : 
+                 callActive ? 'Hands-Free Call Connected' : 'Call Ready'}
+              </span>
+            </div>
 
             {/* Glowing Interactive Voice Orb */}
-            <div className="relative w-64 h-64 sm:w-72 sm:h-72 flex items-center justify-center mb-8">
-              {isListening && (
+            <div className="relative w-72 h-72 sm:w-80 sm:h-80 flex items-center justify-center my-auto">
+              {callState === 'listening' && (
                 <>
                   <div className="ripple-ring"></div>
                   <div className="ripple-ring" style={{ animationDelay: '1s' }}></div>
@@ -431,51 +593,80 @@ export default function KaranApp() {
               )}
 
               <div
-                onClick={toggleListening}
-                className={`w-48 h-48 sm:w-56 sm:h-56 rounded-full cursor-pointer flex flex-col items-center justify-center transition-all duration-700 relative z-10 ${
-                  isSpeaking
-                    ? 'orb-speaking bg-gradient-to-tr from-purple-600 via-indigo-500 to-pink-500'
-                    : isListening
-                    ? 'orb-listening bg-gradient-to-tr from-purple-600 via-indigo-600 to-cyan-500'
-                    : 'orb-idle bg-gradient-to-tr from-purple-900/80 via-indigo-900/60 to-purple-800/80 border border-purple-500/30'
+                onClick={() => {
+                  if (callActive) {
+                    if (callState === 'speaking' && audioPlayerRef.current) {
+                      // Barge-in: interrupt speech and listen to user
+                      audioPlayerRef.current.pause();
+                      setCallState('idle');
+                      resumeContinuousListening();
+                    } else {
+                      stopCall();
+                    }
+                  } else {
+                    startCall();
+                  }
+                }}
+                className={`w-52 h-52 sm:w-60 sm:h-60 rounded-full cursor-pointer flex flex-col items-center justify-center transition-all duration-700 relative z-10 ${
+                  callState === 'speaking'
+                    ? 'orb-speaking bg-gradient-to-tr from-purple-600 via-indigo-500 to-pink-500 shadow-2xl shadow-purple-500/50'
+                    : callState === 'listening'
+                    ? 'orb-listening bg-gradient-to-tr from-purple-600 via-indigo-600 to-cyan-500 shadow-2xl shadow-indigo-500/50'
+                    : callActive
+                    ? 'orb-idle bg-gradient-to-tr from-purple-900 via-indigo-900 to-purple-800 border border-purple-500/40'
+                    : 'bg-gradient-to-tr from-zinc-900 via-[#161622] to-zinc-900 border border-white/[0.1] hover:border-purple-500/40'
                 }`}
               >
-                {isSpeaking ? (
-                  <div className="flex items-center gap-1.5 h-6">
+                {callState === 'speaking' ? (
+                  <div className="flex items-center gap-1.5 h-8">
                     <span className="w-1.5 h-6 bg-white rounded-full animate-bounce"></span>
-                    <span className="w-1.5 h-8 bg-white rounded-full animate-bounce [animation-delay:0.15s]"></span>
-                    <span className="w-1.5 h-10 bg-white rounded-full animate-bounce [animation-delay:0.3s]"></span>
-                    <span className="w-1.5 h-7 bg-white rounded-full animate-bounce [animation-delay:0.45s]"></span>
-                    <span className="w-1.5 h-4 bg-white rounded-full animate-bounce [animation-delay:0.6s]"></span>
+                    <span className="w-1.5 h-10 bg-white rounded-full animate-bounce [animation-delay:0.15s]"></span>
+                    <span className="w-1.5 h-12 bg-white rounded-full animate-bounce [animation-delay:0.3s]"></span>
+                    <span className="w-1.5 h-8 bg-white rounded-full animate-bounce [animation-delay:0.45s]"></span>
+                    <span className="w-1.5 h-5 bg-white rounded-full animate-bounce [animation-delay:0.6s]"></span>
                   </div>
-                ) : isListening ? (
-                  <Mic className="w-10 h-10 text-white animate-pulse" />
+                ) : callState === 'listening' ? (
+                  <div className="flex flex-col items-center">
+                    <Mic className="w-12 h-12 text-white animate-pulse mb-1" />
+                    <span className="text-[11px] font-mono uppercase tracking-wider text-cyan-200">
+                      Listening
+                    </span>
+                  </div>
+                ) : callActive ? (
+                  <div className="flex flex-col items-center">
+                    <Headphones className="w-10 h-10 text-purple-200 mb-1" />
+                    <span className="text-[11px] font-mono uppercase tracking-wider text-purple-300">
+                      Connected
+                    </span>
+                  </div>
                 ) : (
                   <div className="flex flex-col items-center">
-                    <Mic className="w-8 h-8 text-purple-200 mb-1 opacity-80" />
-                    <span className="text-[11px] font-medium tracking-wider uppercase text-purple-200/70">
-                      Tap to Speak
+                    <PhoneCall className="w-10 h-10 text-zinc-400 group-hover:text-purple-300 mb-2" />
+                    <span className="text-xs font-semibold tracking-wider uppercase text-zinc-300">
+                      Start Call
                     </span>
                   </div>
                 )}
               </div>
             </div>
 
-            {/* Live Subtitle Transcript Display */}
-            <div className="max-w-xl w-full text-center min-h-[80px] flex flex-col items-center justify-center px-4">
-              {isListening && (
-                <p className="text-purple-300 text-sm font-medium animate-pulse">
-                  {liveTranscript ? `"${liveTranscript}"` : 'Listening... Speak naturally'}
-                </p>
+            {/* Live Subtitle Transcript Area */}
+            <div className="max-w-xl w-full text-center min-h-[90px] flex flex-col items-center justify-center px-4 mb-4">
+              {liveTranscript && (
+                <div className="bg-purple-950/40 border border-purple-500/30 rounded-2xl p-4 px-6 shadow-lg backdrop-blur-md mb-2">
+                  <p className="text-purple-200 text-sm font-medium">"{liveTranscript}"</p>
+                </div>
               )}
-              {isLoading && (
+
+              {callState === 'thinking' && (
                 <p className="text-zinc-400 text-xs tracking-wide flex items-center gap-2">
                   <span className="w-2 h-2 rounded-full bg-purple-400 animate-ping"></span>
-                  Karan is thinking...
+                  Karan is formulating his response...
                 </p>
               )}
-              {!isListening && !isLoading && messages.length > 0 && (
-                <div className="bg-[#12121c]/80 border border-white/[0.06] rounded-2xl p-4 shadow-xl backdrop-blur-md">
+
+              {!liveTranscript && callState !== 'thinking' && messages.length > 0 && (
+                <div className="bg-[#11111a]/80 border border-white/[0.08] rounded-2xl p-4 px-6 shadow-xl backdrop-blur-md">
                   <p className="text-zinc-200 text-sm sm:text-base leading-relaxed">
                     {messages[messages.length - 1].content}
                   </p>
@@ -483,41 +674,37 @@ export default function KaranApp() {
               )}
             </div>
 
-            {/* Voice Controls Bar */}
-            <div className="mt-8 flex items-center gap-4">
-              <button
-                onClick={toggleListening}
-                className={`flex items-center gap-2 px-6 py-3 rounded-full text-sm font-medium transition-all ${
-                  isListening
-                    ? 'bg-rose-500 text-white shadow-lg shadow-rose-500/30'
-                    : 'bg-purple-600 hover:bg-purple-500 text-white shadow-lg shadow-purple-600/30'
-                }`}
-              >
-                {isListening ? (
-                  <>
-                    <MicOff className="w-4 h-4" /> Stop Listening
-                  </>
-                ) : (
-                  <>
-                    <Mic className="w-4 h-4" /> Start Speaking
-                  </>
-                )}
-              </button>
+            {/* Bottom Controls Bar */}
+            <div className="flex items-center gap-4">
+              {callActive ? (
+                <>
+                  <button
+                    onClick={stopCall}
+                    className="flex items-center gap-2 px-8 py-3.5 rounded-full text-sm font-semibold bg-rose-600 hover:bg-rose-500 text-white shadow-xl shadow-rose-600/30 transition-all hover:scale-105"
+                  >
+                    <PhoneOff className="w-4 h-4" /> End Call
+                  </button>
 
-              {availableVoices.length > 0 && (
-                <select
-                  value={selectedVoice}
-                  onChange={e => setSelectedVoice(e.target.value)}
-                  className="bg-[#151520] border border-white/[0.08] text-xs text-zinc-300 rounded-full px-4 py-2.5 outline-none cursor-pointer max-w-[200px] truncate"
+                  {callState === 'speaking' && (
+                    <button
+                      onClick={() => {
+                        if (audioPlayerRef.current) audioPlayerRef.current.pause();
+                        setCallState('idle');
+                        resumeContinuousListening();
+                      }}
+                      className="px-4 py-3 rounded-full text-xs font-medium bg-white/[0.08] hover:bg-white/[0.14] text-zinc-200 border border-white/[0.1] transition-all"
+                    >
+                      Interrupt &amp; Talk
+                    </button>
+                  )}
+                </>
+              ) : (
+                <button
+                  onClick={startCall}
+                  className="flex items-center gap-2 px-8 py-3.5 rounded-full text-sm font-semibold bg-purple-600 hover:bg-purple-500 text-white shadow-xl shadow-purple-600/30 transition-all hover:scale-105"
                 >
-                  {availableVoices
-                    .filter(v => v.lang.startsWith('en'))
-                    .map(v => (
-                      <option key={v.name} value={v.name}>
-                        {v.name.slice(0, 24)}
-                      </option>
-                    ))}
-                </select>
+                  <PhoneCall className="w-4 h-4" /> Start Hands-Free Call
+                </button>
               )}
             </div>
           </div>
@@ -526,7 +713,7 @@ export default function KaranApp() {
              CHAT & JOURNAL MODE
              ========================================================================== */
           <div className="flex-1 flex flex-col h-full max-w-3xl w-full mx-auto p-4 sm:p-6 overflow-hidden">
-            {/* Quick Prompt Starters */}
+            {/* Quick Starters */}
             <div className="flex items-center gap-2 overflow-x-auto pb-3 mb-2 no-scrollbar">
               {[
                 "How was today's progress?",
@@ -537,7 +724,7 @@ export default function KaranApp() {
               ].map((starter, i) => (
                 <button
                   key={i}
-                  onClick={() => handleSendMessage(starter)}
+                  onClick={() => handleTextSubmit(starter)}
                   className="whitespace-nowrap px-3.5 py-1.5 rounded-full bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-xs text-zinc-300 transition-colors"
                 >
                   {starter}
@@ -545,7 +732,7 @@ export default function KaranApp() {
               ))}
             </div>
 
-            {/* Chat Thread */}
+            {/* Message Thread */}
             <div className="flex-1 overflow-y-auto pr-2 space-y-4">
               {messages.map((msg, index) => {
                 const isUser = msg.role === 'user';
@@ -563,7 +750,7 @@ export default function KaranApp() {
                       className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
                         isUser
                           ? 'bg-purple-600 text-white rounded-tr-sm'
-                          : 'bg-[#151520] border border-white/[0.06] text-zinc-200 rounded-tl-sm shadow-sm'
+                          : 'bg-[#14141f] border border-white/[0.06] text-zinc-200 rounded-tl-sm shadow-sm'
                       }`}
                     >
                       {msg.content}
@@ -576,32 +763,21 @@ export default function KaranApp() {
                   <div className="w-2 h-2 rounded-full bg-purple-500 animate-bounce"></div>
                   <div className="w-2 h-2 rounded-full bg-purple-500 animate-bounce [animation-delay:0.2s]"></div>
                   <div className="w-2 h-2 rounded-full bg-purple-500 animate-bounce [animation-delay:0.4s]"></div>
-                  <span>Karan is writing...</span>
+                  <span>Karan is thinking...</span>
                 </div>
               )}
               <div ref={messagesEndRef} />
             </div>
 
-            {/* Input Bar */}
+            {/* Chat Input Bar */}
             <div className="pt-4 border-t border-white/[0.06]">
               <form
                 onSubmit={e => {
                   e.preventDefault();
-                  handleSendMessage();
+                  handleTextSubmit();
                 }}
-                className="flex items-center gap-2 bg-[#12121c] border border-white/[0.1] rounded-2xl p-2 px-3 shadow-lg focus-within:border-purple-500/50 transition-colors"
+                className="flex items-center gap-2 bg-[#11111a] border border-white/[0.1] rounded-2xl p-2 px-3 shadow-lg focus-within:border-purple-500/50 transition-colors"
               >
-                <button
-                  type="button"
-                  onClick={toggleListening}
-                  className={`p-2 rounded-xl transition-colors ${
-                    isListening ? 'bg-rose-500 text-white' : 'text-zinc-400 hover:text-white'
-                  }`}
-                  title="Speech-to-text dictation"
-                >
-                  <Mic className="w-5 h-5" />
-                </button>
-
                 <input
                   type="text"
                   value={inputText}
@@ -708,7 +884,7 @@ export default function KaranApp() {
       )}
 
       {/* ==========================================================================
-         DAILY MOOD CHECK-IN MODAL
+         DAILY MOOD MODAL
          ========================================================================== */}
       {showMoodModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
