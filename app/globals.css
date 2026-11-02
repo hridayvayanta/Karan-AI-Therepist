@@ -1,0 +1,98 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-main: #09090d;
+  --bg-card: #121218;
+  --bg-elevated: #1a1a24;
+  --accent: #8b5cf6;
+  --accent-light: #a78bfa;
+  --accent-glow: rgba(139, 92, 246, 0.25);
+  --text-main: #f4f4f7;
+  --text-muted: #9494a3;
+  --border-subtle: rgba(255, 255, 255, 0.08);
+}
+
+body {
+  background-color: var(--bg-main);
+  color: var(--text-main);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  overflow-x: hidden;
+  margin: 0;
+  padding: 0;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-main);
+}
+::-webkit-scrollbar-thumb {
+  background: #252533;
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #39394d;
+}
+
+/* Voice Orb Glowing Animations */
+@keyframes orbBreathing {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: 0 0 50px rgba(139, 92, 246, 0.3), inset 0 0 40px rgba(167, 139, 250, 0.4);
+  }
+  50% {
+    transform: scale(1.08);
+    box-shadow: 0 0 80px rgba(139, 92, 246, 0.55), inset 0 0 60px rgba(196, 181, 253, 0.6);
+  }
+}
+
+@keyframes orbActiveSpeak {
+  0% {
+    transform: scale(0.96);
+    box-shadow: 0 0 70px rgba(99, 102, 241, 0.6);
+  }
+  50% {
+    transform: scale(1.15);
+    box-shadow: 0 0 120px rgba(168, 85, 247, 0.8), inset 0 0 50px rgba(236, 72, 153, 0.4);
+  }
+  100% {
+    transform: scale(0.96);
+    box-shadow: 0 0 70px rgba(99, 102, 241, 0.6);
+  }
+}
+
+@keyframes ripplePulse {
+  0% {
+    transform: scale(0.85);
+    opacity: 0.8;
+  }
+  100% {
+    transform: scale(2.2);
+    opacity: 0;
+  }
+}
+
+.orb-idle {
+  animation: orbBreathing 4s ease-in-out infinite;
+}
+
+.orb-listening {
+  animation: orbActiveSpeak 1.6s ease-in-out infinite;
+}
+
+.orb-speaking {
+  animation: orbActiveSpeak 1s ease-in-out infinite;
+}
+
+.ripple-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(139, 92, 246, 0.4);
+  animation: ripplePulse 3s cubic-bezier(0.2, 0.8, 0.2, 1) infinite;
+  pointer-events: none;
+}

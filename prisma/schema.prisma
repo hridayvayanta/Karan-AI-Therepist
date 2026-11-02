@@ -1,0 +1,58 @@
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id            String         @id @default(uuid())
+  name          String         @default("Hriday")
+  email         String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  conversations Conversation[]
+  memories      Memory[]
+  moods         MoodCheckin[]
+}
+
+model Conversation {
+  id        String    @id @default(uuid())
+  title     String    @default("Chat with Karan")
+  userId    String?
+  user      User?     @relation(fields: [userId], references: [id])
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  messages  Message[]
+}
+
+model Message {
+  id             String       @id @default(uuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           String       // "user" | "assistant"
+  content        String
+  createdAt      DateTime     @default(now())
+}
+
+model Memory {
+  id        String   @id @default(uuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  category  String   @default("general") // "project", "habit", "preference", "goal", "stress"
+  fact      String
+  createdAt DateTime @default(now())
+}
+
+model MoodCheckin {
+  id        String   @id @default(uuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  score     Int      // 1 to 10
+  energy    Int?     // 1 to 5
+  notes     String?
+  tags      String?  // comma separated
+  createdAt DateTime @default(now())
+}
